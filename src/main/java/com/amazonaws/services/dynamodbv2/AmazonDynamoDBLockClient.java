@@ -16,6 +16,7 @@ package com.amazonaws.services.dynamodbv2;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -917,7 +918,7 @@ public class AmazonDynamoDBLockClient implements Runnable, Closeable {
                 this.dynamoDB.updateItem(updateItemRequest);
                 lockItem.updateRecordVersionNumber(recordVersionNumber, lastUpdateOfLock, leaseDurationToEnsureInMilliseconds);
             } catch (final ConditionalCheckFailedException conditionalCheckFailedException) {
-                logger.debug("Someone else acquired the lock, so we will stop heartbeating it", conditionalCheckFailedException);
+                logger.warn("Someone else acquired the lock, so we will stop heartbeating it", conditionalCheckFailedException);
                 this.locks.remove(lockItem.getUniqueIdentifier());
                 throw new LockNotGrantedException("Someone else acquired the lock, so we will stop heartbeating it", conditionalCheckFailedException);
             }
@@ -943,6 +944,21 @@ public class AmazonDynamoDBLockClient implements Runnable, Closeable {
                         logger.debug("Hearbeat failed for " + lockEntry, x);
                     } catch (final RuntimeException x) {
                         logger.warn("Exception sending heartbeat for " + lockEntry, x);
+                        if (x.getCause() instanceof SocketTimeoutException) {
+                            LockItem existing = lockEntry.getValue();
+                            Optional<LockItem> lockItem = getLockFromDynamoDB(
+                                new GetLockOptions.GetLockOptionsBuilder(existing.getPartitionKey())
+                                    .withSortKey(existing.getSortKey().orElse(null)).withDeleteLockOnRelease(false).build());
+                            if (!lockItem.isPresent()) continue;
+                            LockItem lock = lockItem.get();
+                            if (existing.getRecordVersionNumber().equals(lock.getRecordVersionNumber())) continue;
+                            if (!existing.getOwnerName().equals(lock.getOwnerName())) continue;
+                            long lastUpdated = LockClientUtils.INSTANCE.millisecondTime();
+                            lock.updateRecordVersionNumber("", lastUpdated, lock.getLeaseDuration());
+                            logger.warn("Update the locks cache to deal with Read Exception " + lock);
+                            this.locks.put(lockEntry.getKey(), lock);
+                        }
+
                     }
                 }
                 final long timeElapsed = LockClientUtils.INSTANCE.millisecondTime() - timeWorkBegins;
